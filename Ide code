@@ -1,0 +1,417 @@
+/*
+  ============================================================
+  SMART PARKING AND VEHICLE ENTRY SYSTEM - FINAL
+  Hardware: ESP32, 1x MFRC522 RFID, 3x IR Sensors, 2x LEDs
+  Services: ThingSpeak, MQTT, Twilio SMS (lot full + payment)
+  ============================================================
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+#include <PubSubClient.h>
+
+// ─── WiFi ────────────────────────────────────────────────
+const char* ssid     = "Samsung";
+const char* password = "#######";
+
+// ─── ThingSpeak ──────────────────────────────────────────
+const char* tsServer = "api.thingspeak.com";
+const char* tsAPIKey = "SLHD5GHIWKUTX3ZI";
+
+// ─── Twilio ──────────────────────────────────────────────
+const char* accountSID = "AC581491d9db0e9f722d28bcd0a8354eba";
+const char* authToken  = "2b774eb2699b03d816da5f867e024d91";
+const char* fromNumber = "+12564140585";
+const char* toNumber   = "+91#########7";
+
+// ─── MQTT ────────────────────────────────────────────────
+const char* mqttServer      = "broker.hivemq.com";
+const int   mqttPort        = 1883;
+const char* mqttTopicStatus = "smartparking/status";  // publish
+const char* mqttTopicGate   = "smartparking/gate";    // subscribe
+
+// ─── RFID ────────────────────────────────────────────────
+#define SS_PIN  5
+#define RST_PIN 4
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ─── Subscribers ─────────────────────────────────────────
+struct Subscriber {
+  const char* name;
+  byte uid[4];
+  int monthlyFee;
+  bool insideLot;
+};
+
+Subscriber subscribers[] = {
+  { "Alice", {0x43, 0x2C, 0x20, 0x90}, 1000, false },
+  { "Bob",   {0x03, 0x09, 0x1D, 0x2F}, 1000, false },
+  { "Carol", {0x00, 0x00, 0x00, 0x00}, 1000, false }, // update UID when available
+};
+const int NUM_SUBSCRIBERS = 3;
+
+// ─── Pins ────────────────────────────────────────────────
+#define IR_SLOT_1  15
+#define IR_SLOT_2  14
+#define IR_SLOT_3  26
+#define LED_GREEN  32
+#define LED_RED    33
+#define SERVO_PIN  13
+
+// ─── Constants ───────────────────────────────────────────
+#define GATE_OPEN  90
+#define GATE_CLOSE 0
+
+// ─── State ───────────────────────────────────────────────
+bool slot1Occupied = false;
+bool slot2Occupied = false;
+bool slot3Occupied = false;
+bool smsSent       = false;
+
+unsigned long lastTSUpdate   = 0;
+unsigned long lastMQTTUpdate = 0;
+const long tsInterval        = 15000;
+const long mqttInterval      = 5000;
+
+// ─── SMS Cooldown ─────────────────────────────────────────
+unsigned long lastSMSTime  = 0;
+const long    smsCooldown  = 10000;  // 10 seconds between any SMS
+
+// ─── Objects ─────────────────────────────────────────────
+Servo barrierServo;
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// ════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IR_SLOT_1, INPUT_PULLUP);
+  pinMode(IR_SLOT_2, INPUT_PULLUP);
+  pinMode(IR_SLOT_3, INPUT_PULLUP);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED,   OUTPUT);
+
+  // Servo
+  barrierServo.attach(SERVO_PIN);
+  barrierServo.write(GATE_CLOSE);
+  Serial.println("Gate initialized — CLOSED");
+
+  SPI.begin();
+  rfid.PCD_Init();
+  Serial.println("RFID Ready!");
+
+  connectWiFi();
+
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  connectMQTT();
+
+  Serial.println("System Ready!");
+}
+
+// ─── Timing ──────────────────────────────────────────────
+unsigned long lastSlotPrint  = 0;
+const long slotPrintInterval = 5000;
+
+// ════════════════════════════════════════════════════════
+//  LOOP
+// ════════════════════════════════════════════════════════
+void loop() {
+
+  if (!mqttClient.connected()) connectMQTT();
+  mqttClient.loop();
+
+  // ── Read IR sensors ──────────────────────────────────
+  slot1Occupied = (digitalRead(IR_SLOT_1) == LOW);
+  slot2Occupied = (digitalRead(IR_SLOT_2) == LOW);
+  slot3Occupied = (digitalRead(IR_SLOT_3) == LOW);
+
+  int occupiedCount = (slot1Occupied ? 1 : 0) +
+                      (slot2Occupied ? 1 : 0) +
+                      (slot3Occupied ? 1 : 0);
+  bool lotFull = (occupiedCount == 3);
+
+  // Update LEDs
+  digitalWrite(LED_GREEN, lotFull ? LOW  : HIGH);
+  digitalWrite(LED_RED,   lotFull ? HIGH : LOW);
+
+  // Print slot status every 5 seconds
+  if (millis() - lastSlotPrint > slotPrintInterval) {
+    Serial.println("─────────────────────────────────────");
+    Serial.printf("Slot Status: A1=%s | A2=%s | A3=%s\n",
+      slot1Occupied ? "OCCUPIED" : "VACANT",
+      slot2Occupied ? "OCCUPIED" : "VACANT",
+      slot3Occupied ? "OCCUPIED" : "VACANT");
+    Serial.printf("Total: %d/3 occupied\n", occupiedCount);
+    Serial.println("Waiting for RFID scan...");
+    Serial.println("─────────────────────────────────────");
+    lastSlotPrint = millis();
+  }
+
+  // Full lot SMS — once only, with cooldown
+  if (lotFull && !smsSent) {
+    Serial.println("⚠ LOT FULL — Sending SMS alert...");
+    safeSendSMS(toNumber, "ALERT: Parking lot is FULL! All 3 slots occupied.");
+    smsSent = true;
+  }
+  if (!lotFull) smsSent = false;
+
+  // ── RFID Check ───────────────────────────────────────
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+
+    Serial.println("\n═══════════════════════════════════");
+    Serial.print("RFID TAG DETECTED — UID:");
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+      Serial.print(rfid.uid.uidByte[i], HEX);
+    }
+    Serial.println();
+
+    int subIndex = findSubscriber();
+
+    if (subIndex >= 0) {
+      Subscriber &sub = subscribers[subIndex];
+
+      if (!sub.insideLot) {
+        // ════ ENTRY ════
+        Serial.println("─── ACTION: ENTRY ───");
+        Serial.printf("Subscriber : %s\n", sub.name);
+        Serial.println("Status     : ENTRY GRANTED");
+        Serial.println("Gate       : OPENING for 8 seconds...");
+        Serial.println("═══════════════════════════════════\n");
+
+        if (!lotFull) {
+          sub.insideLot = true;
+          openGate();
+          delay(8000);
+          closeGate();
+          addMQTTActivity(String(sub.name) + " entered the parking lot");
+        } else {
+          Serial.println("Status     : ENTRY DENIED — Lot Full");
+          String msg = "Hi " + String(sub.name) + "! Parking lot is full. Please try again later.";
+          safeSendSMS(toNumber, msg);
+        }
+
+      } else {
+        // ════ EXIT ════
+        Serial.println("─── ACTION: EXIT ───");
+        Serial.printf("Subscriber : %s\n", sub.name);
+        Serial.println("Status     : EXIT GRANTED");
+        Serial.println("Gate       : OPENING for 8 seconds...");
+
+        int dailyRate = sub.monthlyFee / 30;
+        Serial.printf("Payment    : Rs.%d deducted (Rs.%d/month)\n", dailyRate, sub.monthlyFee);
+        Serial.println("SMS        : Sending payment notification...");
+        Serial.println("═══════════════════════════════════\n");
+
+        sub.insideLot = false;
+        openGate();
+        delay(8000);
+        closeGate();
+
+        // Payment SMS
+        String msg = "Hi " + String(sub.name) + "! You have exited SmartPark. ";
+        msg += "Rs." + String(dailyRate) + " deducted from your monthly subscription ";
+        msg += "(Rs." + String(sub.monthlyFee) + "/month). Thank you!";
+        safeSendSMS(toNumber, msg);
+        addMQTTActivity(String(sub.name) + " exited — Rs." + String(dailyRate) + " deducted");
+      }
+
+    } else {
+      // ════ UNAUTHORIZED ════
+      Serial.println("─── ACTION: ACCESS DENIED ───");
+      Serial.println("Status     : UNAUTHORIZED TAG");
+      Serial.println("Gate       : REMAINS CLOSED");
+      Serial.println("SMS        : Sending alert...");
+      Serial.println("═══════════════════════════════════\n");
+      addMQTTActivity("Unauthorized tag scanned — Access Denied");
+      safeSendSMS(toNumber, "ALERT: Unauthorized RFID tag scanned at SmartPark gate!");
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    delay(2000); // prevent double scan
+  }
+
+  // ThingSpeak every 15 seconds
+  if (millis() - lastTSUpdate > tsInterval) {
+    sendToThingSpeak();
+    lastTSUpdate = millis();
+  }
+
+  // MQTT publish every 5 seconds
+  if (millis() - lastMQTTUpdate > mqttInterval) {
+    publishMQTTStatus(occupiedCount);
+    lastMQTTUpdate = millis();
+  }
+}
+
+// ════════════════════════════════════════════════════════
+//  FUNCTIONS
+// ════════════════════════════════════════════════════════
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+}
+
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting MQTT...");
+    if (mqttClient.connect("ESP32_SmartParking")) {
+      Serial.println("Connected!");
+      mqttClient.subscribe(mqttTopicGate);
+    } else {
+      Serial.print("Failed rc=");
+      Serial.println(mqttClient.state());
+      delay(3000);
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (int i = 0; i < length; i++) msg += (char)payload[i];
+  Serial.println("MQTT received: " + msg);
+
+  if (String(topic) == mqttTopicGate) {
+    if (msg == "OPEN") {
+      openGate();
+      addMQTTActivity("Gate opened via MQTT remote command");
+    } else if (msg == "CLOSE") {
+      closeGate();
+      addMQTTActivity("Gate closed via MQTT remote command");
+    }
+  }
+}
+
+void publishMQTTStatus(int occupiedCount) {
+  String json = "{";
+  json += "\"slot1\":" + String(slot1Occupied ? 1 : 0) + ",";
+  json += "\"slot2\":" + String(slot2Occupied ? 1 : 0) + ",";
+  json += "\"slot3\":" + String(slot3Occupied ? 1 : 0) + ",";
+  json += "\"occupied\":" + String(occupiedCount) + ",";
+  json += "\"total\":3";
+  json += "}";
+  mqttClient.publish(mqttTopicStatus, json.c_str());
+  Serial.println("MQTT Published: " + json);
+}
+
+void addMQTTActivity(String activity) {
+  mqttClient.publish("smartparking/activity", activity.c_str());
+}
+
+void openGate() {
+  barrierServo.write(GATE_OPEN);
+  Serial.println("Gate OPENED");
+}
+
+void closeGate() {
+  barrierServo.write(GATE_CLOSE);
+  Serial.println("Gate CLOSED");
+}
+
+// ─── Safe SMS with cooldown ───────────────────────────────
+void safeSendSMS(String to, String body) {
+  if (millis() - lastSMSTime > smsCooldown) {
+    sendTwilioSMS(to, body);
+    lastSMSTime = millis();
+  } else {
+    Serial.println("SMS skipped — cooldown active (10s between messages)");
+  }
+}
+
+// Find subscriber by scanned UID
+int findSubscriber() {
+  for (int i = 0; i < NUM_SUBSCRIBERS; i++) {
+    bool match = true;
+    for (byte j = 0; j < 4; j++) {
+      if (rfid.uid.uidByte[j] != subscribers[i].uid[j]) {
+        match = false;
+        break;
+      }
+    }
+    // Skip empty UIDs
+    bool emptyUID = true;
+    for (byte j = 0; j < 4; j++) {
+      if (subscribers[i].uid[j] != 0x00) { emptyUID = false; break; }
+    }
+    if (match && !emptyUID) return i;
+  }
+  return -1;
+}
+
+void sendToThingSpeak() {
+  WiFiClient client;
+  if (client.connect(tsServer, 80)) {
+    String url = "/update?api_key=" + String(tsAPIKey);
+    url += "&field1=" + String(slot1Occupied ? 1 : 0);
+    url += "&field2=" + String(slot2Occupied ? 1 : 0);
+    url += "&field3=" + String(slot3Occupied ? 1 : 0);
+    client.print("GET " + url + " HTTP/1.1\r\nHost: api.thingspeak.com\r\nConnection: close\r\n\r\n");
+    client.stop();
+    Serial.println("ThingSpeak updated!");
+  } else Serial.println("ThingSpeak failed");
+}
+
+void sendTwilioSMS(String to, String body) {
+  WiFiClientSecure sc;
+  sc.setInsecure();
+  if (sc.connect("api.twilio.com", 443)) {
+    String post = "To=" + urlencode(to) +
+                  "&From=" + urlencode(String(fromNumber)) +
+                  "&Body=" + urlencode(body);
+    String req = "POST /2010-04-01/Accounts/" + String(accountSID) + "/Messages.json HTTP/1.1\r\n";
+    req += "Host: api.twilio.com\r\n";
+    req += "Authorization: Basic " + base64Encode(String(accountSID) + ":" + String(authToken)) + "\r\n";
+    req += "Content-Type: application/x-www-form-urlencoded\r\n";
+    req += "Content-Length: " + String(post.length()) + "\r\n";
+    req += "Connection: close\r\n\r\n" + post;
+    sc.print(req);
+    delay(2000);
+    while (sc.available()) Serial.println(sc.readStringUntil('\n'));
+    sc.stop();
+    Serial.println("SMS Sent: " + body);
+  } else Serial.println("Twilio connection failed");
+}
+
+String urlencode(String s) {
+  String e = "";
+  for (int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if      (c == '+') e += "%2B";
+    else if (c == ' ') e += "%20";
+    else if (c == '/') e += "%2F";
+    else if (c == ':') e += "%3A";
+    else if (c == '!') e += "%21";
+    else if (c == '.') e += "%2E";
+    else               e += c;
+  }
+  return e;
+}
+
+String base64Encode(String in) {
+  const char* b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String out = "";
+  int i = 0, len = in.length();
+  while (i < len) {
+    byte b0 = in[i++];
+    byte b1 = i < len ? in[i++] : 0;
+    byte b2 = i < len ? in[i++] : 0;
+    out += b[b0 >> 2];
+    out += b[((b0 & 3) << 4) | (b1 >> 4)];
+    out += b1 ? b[((b1 & 0xf) << 2) | (b2 >> 6)] : '=';
+    out += b2 ? b[b2 & 0x3f] : '=';
+  }
+  return out;
+}
