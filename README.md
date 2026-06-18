@@ -1,3 +1,4 @@
+
 # 🚗 Smart Parking & Vehicle Entry System
 
 <p align="center">
@@ -216,19 +217,40 @@ smart-parking-system/
 ### Dashboard
 
 ```md
-![Dashboard](images/dashboard.png)
+![Dashboard]
+<img width="1600" height="813" alt="webpage2" src="https://github.com/user-attachments/assets/3bbd62b7-e8bf-467b-9d89-2c50f93cb748" />
+
+
 ```
 
 ### Hardware Setup
 
 ```md
-![Hardware](images/hardware.jpg)
+![Hardware]
+
+<img width="918" height="1353" alt="setup" src="https://github.com/user-attachments/assets/9fcb15ee-5bfb-462e-8720-4181b547e9a5" />
 ```
 
 ### ThingSpeak Visualization
 
 ```md
-![ThingSpeak](images/thingspeak.png)
+![ThingSpeak]
+<img width="1600" height="773" alt="webpage1" src="https://github.com/user-attachments/assets/a29cad8b-816e-4d7a-a6a1-1486a52a7438" />
+
+<img width="1080" height="684" alt="payment sms" src="https://github.com/user-attachments/assets/3bb16ca9-4b1d-46a8-8d10-eb86ee82a96e" />
+
+
+<img width="1080" height="434" alt="slotfull sms" src="https://github.com/user-attachments/assets/f28fb9e1-f444-4b21-8c31-e1aa1693cbfe" />
+
+
+<img width="1080" height="498" alt="unauthorised sms" src="https://github.com/user-attachments/assets/5d9fa736-cbd3-4985-8896-cafc6d4e828b" />
+
+
+<img width="1042" height="704" alt="serial monitor" src="https://github.com/user-attachments/assets/b01f4e8e-00a7-43e1-94fe-38e081be7b4d" />
+
+
+<img width="853" height="1280" alt="flowchart image" src="https://github.com/user-attachments/assets/c7732976-3d60-4cf2-a1dd-50762d7745e4" />
+
 ```
 
 ---
